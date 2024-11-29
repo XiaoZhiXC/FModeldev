@@ -6,7 +6,7 @@ on:
         appVersion:
           description: 'FModel Version And Release Tag'
           required: true
-          default: '4.0.X.X'
+          default: '4.8.8.8'
 
 jobs:
   build:
