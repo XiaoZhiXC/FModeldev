@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -27,8 +28,8 @@ using CUE4Parse.GameTypes.NetEase.MAR.Encryption.Aes;
 using CUE4Parse.GameTypes.PAXDEI.Encryption.Aes;
 using CUE4Parse.GameTypes.Rennsport.Encryption.Aes;
 using CUE4Parse.GameTypes.Snowbreak.Encryption.Aes;
-using CUE4Parse.GameTypes.UDWN.Encryption.Aes;
 using CUE4Parse.GameTypes.THPS.Encryption.Aes;
+using CUE4Parse.GameTypes.UDWN.Encryption.Aes;
 using CUE4Parse.MappingsProvider;
 using CUE4Parse.UE4.AssetRegistry;
 using CUE4Parse.UE4.Assets.Exports;
@@ -42,7 +43,6 @@ using CUE4Parse.UE4.Assets.Exports.Verse;
 using CUE4Parse.UE4.Assets.Exports.Wwise;
 using CUE4Parse.UE4.IO;
 using CUE4Parse.UE4.Localization;
-using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.Core.Serialization;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Oodle.Objects;
@@ -53,9 +53,11 @@ using CUE4Parse.UE4.Wwise;
 
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Sounds;
-using CUE4Parse.UE4.Assets;
+
 using EpicManifestParser;
+using EpicManifestParser.UE;
 using EpicManifestParser.ZlibngDotNetDecompressor;
+
 using FModel.Creator;
 using FModel.Extensions;
 using FModel.Framework;
@@ -66,7 +68,7 @@ using FModel.Views.Resources.Controls;
 using FModel.Views.Snooper;
 
 using Newtonsoft.Json;
-using OffiUtils;
+
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 
@@ -77,6 +79,7 @@ using SkiaSharp;
 using UE4Config.Parsing;
 
 using Application = System.Windows.Application;
+using FGuid = CUE4Parse.UE4.Objects.Core.Misc.FGuid;
 
 namespace FModel.ViewModels;
 
@@ -84,7 +87,7 @@ public class CUE4ParseViewModel : ViewModel
 {
     private ThreadWorkerViewModel _threadWorkerView => ApplicationService.ThreadWorkerView;
     private ApiEndpointViewModel _apiEndpointView => ApplicationService.ApiEndpointView;
-    private readonly Regex _fnLive = new(@"^FortniteGame[/\\]Content[/\\]Paks[/\\]",
+    private readonly Regex _fnLiveRegex = new(@"^FortniteGame[/\\]Content[/\\]Paks[/\\]",
         RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private string _internalGameName;
@@ -247,48 +250,52 @@ public class CUE4ParseViewModel : ViewModel
                             };
 
                             var startTs = Stopwatch.GetTimestamp();
-                            var (manifest, _) = manifestInfo.DownloadAndParseAsync(manifestOptions,
-                                cancellationToken: cancellationToken,
-                                elementManifestPredicate: x => x.Uri.Host is ("epicgames-download1.akamaized.net" or "download.epicgames.com")
-                                ).GetAwaiter().GetResult();
-                            var parseTime = Stopwatch.GetElapsedTime(startTs);
+                            FBuildPatchAppManifest manifest;
 
-                            foreach (var fileManifest in manifest.Files)
+                            try
                             {
-                                if (fileManifest.FileName.Equals("Cloud/IoStoreOnDemand.ini", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    IoStoreOnDemand.Read(new StreamReader(fileManifest.GetStream()));
-                                    continue;
-                                }
-
-                                if (!_fnLive.IsMatch(fileManifest.FileName))
-                                {
-                                    continue;
-                                }
-
-                                p.RegisterVfs(fileManifest.FileName, [fileManifest.GetStream()]
-                                    , it => new FRandomAccessStreamArchive(it, manifest.Files.First(x => x.FileName.Equals(it)).GetStream(), p.Versions));
+                                (manifest, _) = manifestInfo.DownloadAndParseAsync(manifestOptions,
+                                    cancellationToken: cancellationToken,
+                                    elementManifestPredicate: static x => x.Uri.Host != "cloudflare.epicgamescdn.com"
+                                ).GetAwaiter().GetResult();
+                            }
+                            catch (HttpRequestException ex)
+                            {
+                                Log.Error("Failed to download manifest ({ManifestUri})", ex.Data["ManifestUri"]?.ToString() ?? "");
+                                throw;
                             }
 
+                            if (manifest.TryFindFile("Cloud/IoStoreOnDemand.ini", out var ioStoreOnDemandFile))
+                            {
+                                IoStoreOnDemand.Read(new StreamReader(ioStoreOnDemandFile.GetStream()));
+                            }
+
+                            Parallel.ForEach(manifest.Files.Where(x => _fnLiveRegex.IsMatch(x.FileName)), fileManifest =>
+                            {
+                                p.RegisterVfs(fileManifest.FileName, [fileManifest.GetStream()],
+                                    it => new FRandomAccessStreamArchive(it, manifest.FindFile(it)!.GetStream(), p.Versions));
+                            });
+
+                            var elapsedTime = Stopwatch.GetElapsedTime(startTs);
                             FLogger.Append(ELog.Information, () =>
-                                FLogger.Text($"Fortnite [LIVE] has been loaded successfully in {parseTime.TotalMilliseconds}ms", Constants.WHITE, true));
+                                FLogger.Text($"Fortnite [LIVE] has been loaded successfully in {elapsedTime.TotalMilliseconds:F1}ms", Constants.WHITE, true));
                             break;
                         }
                         case "ValorantLive":
                         {
-                            var manifestInfo = _apiEndpointView.ValorantApi.GetManifest(cancellationToken);
-                            if (manifestInfo == null)
+                            var manifest = _apiEndpointView.ValorantApi.GetManifest(cancellationToken);
+                            if (manifest == null)
                             {
                                 throw new Exception("Could not load latest Valorant manifest, you may have to switch to your local installation.");
                             }
 
-                            for (var i = 0; i < manifestInfo.Paks.Length; i++)
+                            Parallel.ForEach(manifest.Paks, pak =>
                             {
-                                p.RegisterVfs(manifestInfo.Paks[i].GetFullName(), [manifestInfo.GetPakStream(i)]);
-                            }
+                                p.RegisterVfs(pak.GetFullName(), [pak.GetStream(manifest)]);
+                            });
 
                             FLogger.Append(ELog.Information, () =>
-                                FLogger.Text($"Valorant '{manifestInfo.Header.GameVersion}' has been loaded successfully", Constants.WHITE, true));
+                                FLogger.Text($"Valorant '{manifest.Header.GameVersion}' has been loaded successfully", Constants.WHITE, true));
                             break;
                         }
                     }
@@ -640,6 +647,7 @@ public class CUE4ParseViewModel : ViewModel
             case "bat":
             case "dat":
             case "cfg":
+            case "ddr":
             case "ide":
             case "ipl":
             case "zon":
